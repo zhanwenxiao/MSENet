@@ -1,0 +1,26 @@
+data:
+  class: HKiCD.HKDataset
+  dataset_name: "HKCD"
+  task: change_detection
+  dataTrainFile: /home/user/zhanwenxiao/instancesegmentation/data/hkcd/train/ #/gpfswork/rech/rin/utf14pr/dataset/AHN/DS_4Classes_new_Divided/
+  dataValFile: /home/user/zhanwenxiao/instancesegmentation/data/hkcd/validation/ #/share/projects/deep3dt/datasets/AHN/DS_4Classes_new_Divided/Val/ #
+  dataTestFile: /home/user/zhanwenxiao/instancesegmentation/data/hkcd/test/ #37EN1_08_full/ #CleanManually/ #/share/projects/deep3dt/datasets/AHN/DS_4Classes_new_Divided/Test/ #
+  dataroot: data
+  preprocessed_dir: /home/user/zhanwenxiao/instancesegmentation/data/hkcd/testets/ #/gpfswork/rech/rin/utf14pr/
+  nameInPly: "vertex" # IEEE V1 : "Urb3DSimul" / IEEE V2:"Params"
+  first_subsampling: 1.35 #2 #1.5  # Grid size of the input data
+  use_category: False # Use object category information
+  radius: 30 #50 #30 #50 #15
+  sample_per_epoch: 1000 #3000 #6000
+  fix_cyl: False # Fix cylinder a special seed and do not apply DA --> for transfer learning tests
+  DA: True # Make data augmentation for train ds
+  pre_transforms: # Offline transforms, done only once
+    - transform: GridSampling3D
+      params:
+        size: ${data.first_subsampling}
+        mode: last
+
+
+  load_preprocessed: False # Whether to load or not pre_transform point clouds, if not original files will be computed again
+  load_trees: False # Whether to load or not kd trees if possible
+
