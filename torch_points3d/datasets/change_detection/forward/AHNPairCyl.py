@@ -27,7 +27,7 @@ from torch_points3d.datasets.change_detection.base_siamese_dataset import BaseSi
 from torch_points3d.datasets.change_detection.pair import Pair, MultiScalePair
 from torch_points3d.metrics.change_detection_tracker import CDTracker
 from torch_points3d.metrics.urb3DCD_tracker import Urb3DCDTracker
-from torch_points3d.datasets.change_detection.AHNPairCylinder import AHNCylinder, to_ply
+from torch_points3d.datasets.change_detection.AHNbiCD import AHNCylinder, to_ply
 
 
 import matplotlib.pyplot as plt

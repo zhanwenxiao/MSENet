@@ -5,7 +5,7 @@
       <paths name="Copy of project-level server '实验室4090_2'">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/user/zhanwenxiao/instancesegmentation/code/instance_changedetection" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/home/user/zhanwenxiao/instancechangedetection/github" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

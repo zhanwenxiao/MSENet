@@ -1,10 +1,10 @@
 models:
   # KPConv: Flexible and Deformable Convolution for Point Clouds (https://arxiv.org/abs/1904.08889)
   # KPConv support format_type="[PARTIAL_DENSE | MESSAGE_PASSING]"
-  SiamEncFusionSkipKPConv:
-    path_pretrained: "" #"/gpfswork/rech/rin/utf14pr/dev/torch-points3d/outputs/2021-07-30-V2-Lid05/11-10-03/SiameseKPConv.pt" #"/share/projects/deep3dt/res/AHN/Transfer/SiameseKPConv.pt" #
-    weight_name: "latest"
-    class: inst_cluster_and_softmax_v2.SiamEncFusionSkipKPConv
+  MSENet:
+    path_pretrained: ""
+    weight_name: "" # best_map
+    class: MSENet.MSENet
     conv_type: "PARTIAL_DENSE"
     use_category: ${data.use_category}
     define_constants:

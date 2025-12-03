@@ -1,16 +1,11 @@
-from typing import Any
 import logging
-from omegaconf.dictconfig import DictConfig
-from omegaconf.listconfig import ListConfig
 from torch.nn import Sequential, Dropout, Linear
 import torch.nn.functional as F
 from torch import nn
-from plyfile import PlyData, PlyElement
 import numpy as np
 import copy
 
 from torch.cuda.amp import autocast
-from torch_points3d.core.common_modules import FastBatchNorm1d
 from torch_points3d.modules.KPConv import *
 from torch_points3d.core.base_conv.partial_dense import *
 from torch_points3d.core.common_modules import MultiHeadClassifier
@@ -20,11 +15,8 @@ from torch_points3d.third_party.pointnet2.pointnet2_utils import furthest_point_
 from torch_points3d.models.change_detection.inst_dir.matcher import HungarianMatcher
 from torch_points3d.models.change_detection.inst_dir.criterion import SetCriterion
 
-from torch_points3d.datasets.multiscale_data import MultiScaleBatch
-from torch_geometric.data import Data
 from torch_geometric.nn import knn
-
-from torch_points3d.datasets.change_detection.pair import PairBatch, PairMultiScaleBatch
+from torch_points3d.datasets.change_detection.pair import PairMultiScaleBatch
 from torch_points3d.models.change_detection.position_embedding import PositionEmbeddingCoordsSine
 
 log = logging.getLogger(__name__)
@@ -46,7 +38,7 @@ class BaseFactoryPSI:
 
 
 ####################SIAMESE ENCODER FUSION KP CONV ############################
-class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
+class MSENet(UnwrappedUnetBasedModel):
     def __init__(self, option, model_type, dataset, modules):
         # Extract parameters from the dataset
         self.change_num_classes = dataset.change_classes
@@ -85,12 +77,6 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                 dropout_proba=last_mlp_opt.dropout,
                 bn_momentum=last_mlp_opt.bn_momentum,
             )
-            # self.sem_FC_layer = MultiHeadClassifier(
-            #     last_mlp_opt.nn[0],
-            #     self._class_to_seg,
-            #     dropout_proba=last_mlp_opt.dropout,
-            #     bn_momentum=last_mlp_opt.bn_momentum,
-            # )
         else:
             in_feat = last_mlp_opt.nn[0] + self._num_categories
             self.change_FC_layer = Sequential()
@@ -106,27 +92,12 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                         ]
                     ),
                 )
-                # self.sem_FC_layer.add_module(
-                #     str(i),
-                #     Sequential(
-                #         *[
-                #             Linear(in_feat, last_mlp_opt.nn[i], bias=False),
-                #             FastBatchNorm1d(last_mlp_opt.nn[i], momentum=last_mlp_opt.bn_momentum),
-                #             nn.LeakyReLU(0.2),
-                #         ]
-                #     ),
-                # )
                 in_feat = last_mlp_opt.nn[i]
 
             if last_mlp_opt.dropout:
                 self.change_FC_layer.add_module("Dropout", Dropout(p=last_mlp_opt.dropout))
-                # self.sem_FC_layer.add_module("Dropout", Dropout(p=last_mlp_opt.dropout))
-
             self.change_FC_layer.add_module("Class", Lin(in_feat, self.change_num_classes, bias=False))
             self.change_FC_layer.add_module("Softmax", nn.LogSoftmax(-1))
-
-            # self.sem_FC_layer.add_module("Class", Lin(in_feat, self.sem_num_classes, bias=False))
-            # self.sem_FC_layer.add_module("Softmax", nn.LogSoftmax(-1))
 
         #### INSTANCE DECODER ####
         self.mask_dim = 64
@@ -134,6 +105,11 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         self.use_np_features = False
         hidden_dim = last_mlp_opt.nn[0] + self._num_categories
         self.mask_embed_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.inst_feat_embed_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -158,7 +134,7 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
             normalize=True,
         )
         self.mask_features_head = Lin(hidden_dim, hidden_dim, bias=False)
-        # self.softmax = nn.LogSoftmax(-1)
+        self.change_activation = nn.Sigmoid() #nn.Sigmoid() #nn.Softmax()
 
         self.num_decoders = 4
         self.shared_decoder = True
@@ -178,6 +154,23 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         dropout = 0.0
 
         num_shared = self.num_decoders if not self.shared_decoder else 1
+
+        self.inst_concat_head = nn.ModuleList()
+        self.tmp_change_conv = nn.ModuleList()
+        PLANES = (128, 256, 512, 1024, 2048)
+        self.tmp_change_conv.append(
+            nn.Linear(PLANES[0] * 2, PLANES[0])
+        )
+        for i, hlevel in enumerate(self.hlevels):
+            self.tmp_change_conv.append(
+                nn.Linear(PLANES[hlevel] * 2, PLANES[hlevel])
+            )
+            self.inst_concat_head.append(
+                nn.Linear(hidden_dim * (len(self.hlevels) - 1), PLANES[4 - hlevel])
+            )
+        self.inst_concat_head.append(
+            nn.Linear(hidden_dim, PLANES[0])
+        )
 
         for _ in range(num_shared):
             tmp_cross_attention = nn.ModuleList()
@@ -257,7 +250,6 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         self.lambda_internal_losses = self.get_from_opt(option, ["loss_weights", "lambda_internal_losses"])
 
         self.visual_names = ["data_visual"]
-
 
     def _init_from_compact_format(self, opt, model_type, dataset, modules_lib):
         """Create a unetbasedmodel from the compact options format - where the
@@ -351,7 +343,23 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
             self.target_y_target = data.target_y_target
             self.change_y = data.change_y.to(device)
             self.change_y_target = data.change_y_target.to(device)
-            self.labels = [self.change_y, self.change_y_target, self.target_y, self.target_y_target]
+            pos_y = data.pos_b
+            pos_y_target = data.pos_b_target
+            full_target_y = data.full_target_y
+            full_target_y_target = data.target_y_target
+            full_pos = data.full_pos
+            full_pos_target = data.full_pos_target
+
+            full_rgb = data.full_rgb
+            full_rgb_target = data.full_rgb_target
+
+            full_change = data.full_change_y
+            full_change_target = data.full_change_y_target
+            full_inst_y = data.full_inst_y
+            full_inst_y_target = data.full_inst_y_target
+            self.labels = [self.change_y, self.change_y_target, self.target_y, self.target_y_target, full_target_y,
+                           full_target_y_target, full_change, full_change_target, full_inst_y, full_inst_y_target,
+                           full_pos, full_pos_target, full_rgb, full_rgb_target, pos_y, pos_y_target]
         else:
             self.input = data
             self.target_y = None
@@ -367,13 +375,6 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
             c_idx = torch.argwhere(uni_cluster_idx != cluster_idx).reshape(-1, )
             output_mask[c_idx, uni_cluster_idx] = 1
         return output_mask.bool()
-
-        # output_mask = torch.ones_like(init_mask, device=cluster_idx.device)
-        # uni_cluster_idxs = cluster_idx.unique()
-        # for uni_cluster_idx in uni_cluster_idxs:
-        #     c_idx = torch.argwhere(uni_cluster_idx == cluster_idx).reshape(-1, )
-        #     output_mask[c_idx, uni_cluster_idx] = 0
-        # return output_mask.bool()
 
     def get_pos_encs(self, b_coords):
         pos_encodings_pcd, b_l = [], []
@@ -460,6 +461,15 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         query_pos = query_pos.permute((2, 0, 1))
         return queries, query_pos
 
+    def _get_inst_feat(self, queries, mask_feats):
+        inst_feats = []
+        for query, mask_feat in zip(queries, mask_feats):
+            inst_feat = mask_feat @ query
+            inst_feats.append(inst_feat)
+        inst_feats = torch.concat(inst_feats, dim=0)
+        inst_feats = self.inst_feat_embed_head(inst_feats)
+        return inst_feats
+
     def mask_module(self, query_feat, mask_features, num_pooling_steps, pcd_features, sampler_list, ret_attn_mask=True):
         query_feat = self.decoder_norm(query_feat)
         mask_embed = self.mask_embed_head(query_feat)
@@ -473,40 +483,39 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
             )
         outputs_mask = torch.cat(output_masks)
 
+        attn_mask = pcd_features.clone()
+        attn_mask.x = outputs_mask
+        for i in range(num_pooling_steps):
+            attn_mask = sampler_list[i](attn_mask.clone())
+        am_batch = attn_mask.batch
+        de_b = []
+        uni_b = torch.unique(am_batch)
+        for b in uni_b:
+            _bid = torch.argwhere(am_batch == b).reshape(-1, )
+            de_b.append(_bid)
+        inst_feat = self._get_inst_feat(query_feat, self.decompose(attn_mask.x, de_b))
+        inst_feat = self.decompose(inst_feat, de_b)
         if ret_attn_mask:
-            attn_mask = pcd_features.clone()
-            attn_mask.x = outputs_mask
-            for i in range(num_pooling_steps):
-                attn_mask = sampler_list[i](attn_mask.clone())
-            am_batch = attn_mask.batch
             attn_mask = attn_mask.x
-
             cluster_idx = torch.argmax(attn_mask.detach(), dim=1)
             output_mask = self._get_attn(attn_mask.detach(), cluster_idx)
             attn_mask = output_mask
 
             # attn_mask = attn_mask.detach().sigmoid() < 0.5
-
             #### Decompose Batch ####
-            de_b = []
-            uni_b = torch.unique(am_batch)
-            for b in uni_b:
-                _bid = torch.argwhere(am_batch == b).reshape(-1, )
-                de_b.append(_bid)
             attn_mask = self.decompose(attn_mask, de_b)
             #########################
-
             return (
                 outputs_class,
                 output_masks,
                 attn_mask,
+                inst_feat
             )
-        return outputs_class, output_masks
+        return outputs_class, output_masks, inst_feat
 
-    def backbone(self):
-        """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
-        change_stack_down, sem_stack_down_0, sem_stack_down_1, pos_stack_0, pos_stack_1 = [], [], [], [], []
-        aux0, aux1 = [], []
+    def feat_encoder(self):
+        sem_stack_down_0, sem_stack_down_1, pos_stack_0, pos_stack_1 = [], [], [], []
+        cd_stack_down_0, cd_stack_down_1 = [], []
         sampler_list = []
 
         data0 = self.input0
@@ -515,39 +524,74 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         #### Feature Encoder ####
         data0 = self.down_modules[0](data0, precomputed=self.pre_computed)
         data1 = self.down_modules[0](data1, precomputed=self.pre_computed_target)
-        nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        diff = data1.clone()
-        diff.x = data1.x - data0.x[nn_list[1, :], :]
+        nn_list1 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
+        nn_list0 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
+
         sem_stack_down_0.append(data0.clone())
         sem_stack_down_1.append(data1.clone())
         pos_stack_0.append(data0.clone())
         pos_stack_1.append(data1.clone())
-        change_stack_down.append(diff)
+
+        diff0 = data0.clone()
+        diff0.x = data0.x - data1.x[nn_list1[1, :], :]
+        diff1 = data1.clone()
+        diff1.x = data1.x - data0.x[nn_list0[1, :], :]
+
+        cd_stack_down_0.append(diff0)
+        cd_stack_down_1.append(diff1)
+
+        data0.x = torch.cat((data0.x, diff0.x), axis=1)
+        data1.x = torch.cat((data1.x, diff1.x), axis=1)
 
         for i in range(1, len(self.down_modules) - 1):
             data0 = self.down_modules[i](data0, precomputed=self.pre_computed)
             data1 = self.down_modules[i](data1, precomputed=self.pre_computed_target)
-            nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-            diff = data1.clone()
-            diff.x = data1.x - data0.x[nn_list[1, :], :]
+            nn_list1 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
+            nn_list0 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
+
             sem_stack_down_0.append(data0.clone())
             sem_stack_down_1.append(data1.clone())
             pos_stack_0.append(data0.clone())
             pos_stack_1.append(data1.clone())
-            change_stack_down.append(diff)
+
+            diff0 = data0.clone()
+            diff0.x = data0.x - data1.x[nn_list1[1, :], :]
+            diff1 = data1.clone()
+            diff1.x = data1.x - data0.x[nn_list0[1, :], :]
+
+            cd_stack_down_0.append(diff0)
+            cd_stack_down_1.append(diff1)
+
+            data0.x = torch.cat((data0.x, diff0.x), axis=1)
+            data1.x = torch.cat((data1.x, diff1.x), axis=1)
+
             for sampler in self.down_modules[i].sampler:
                 if sampler is not None:
                     sampler_list.append(sampler)
 
-        # 1024
         data0 = self.down_modules[-1](data0, precomputed=self.pre_computed)
         data1 = self.down_modules[-1](data1, precomputed=self.pre_computed_target)
+        nn_list1 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
+        nn_list0 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
+
+        diff0 = data0.clone()
+        diff0.x = data0.x - data1.x[nn_list1[1, :], :]
+        diff1 = data1.clone()
+        diff1.x = data1.x - data0.x[nn_list0[1, :], :]
+
+        cd_stack_down_0.append(diff0)
+        cd_stack_down_1.append(diff1)
 
         for sampler in self.down_modules[-1].sampler:
             if sampler is not None:
                 sampler_list.append(sampler)
+        sem_stack_down_0.append(data0)
+        sem_stack_down_1.append(data1)
+        return cd_stack_down_0, cd_stack_down_1, sem_stack_down_0, sem_stack_down_1, pos_stack_0, pos_stack_1, sampler_list
 
+    def sem_decoder(self, data0, data1, pos_stack_0, pos_stack_1, sem_stack_down_0, sem_stack_down_1):
         #### Sem Decoder ####
+        aux0, aux1 = [], []
         sem_data_0 = data0.clone()
         sem_data_1 = data1.clone()
         pos_stack_0.append(data0.clone())
@@ -576,21 +620,12 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
 
         last_feature_0 = sem_data_0.x
         last_feature_1 = sem_data_1.x
-        # if self._use_category:
-        #     self.sem_output0 = self.sem_FC_layer(last_feature_0, self.category)
-        #     self.sem_output1 = self.sem_FC_layer(last_feature_1, self.category)
-        # else:
-        #     self.sem_output0 = self.sem_FC_layer(last_feature_0)
-        #     self.sem_output1 = self.sem_FC_layer(last_feature_1)
-        # sem_dec.reverse()
+        return last_feature_0, last_feature_1, aux0, aux1
 
-        #### Change Decoder ####
-        nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        data = data1.clone()
-        data.x = data1.x - data0.x[nn_list[1, :], :]
+    def change_decoder(self, data, change_stack_down):
         innermost = False
         if not isinstance(self.inner_modules[0], Identity):
-            change_stack_down.append(data1)
+            change_stack_down.append(data)
             data = self.inner_modules[0](data)
             innermost = True
         for i in range(len(self.up_change_modules)):
@@ -600,120 +635,63 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                 data = self.up_change_modules[i]((data, change_stack_down.pop()), precomputed=self.upsample_target)
         last_feature = data.x
         if self._use_category:
-            self.change_output = self.change_FC_layer(last_feature, self.category)
+            change_output = self.change_FC_layer(last_feature, self.category)
         else:
-            self.change_output = self.change_FC_layer(last_feature)
+            change_output = self.change_FC_layer(last_feature)
+        return change_output
 
-        return last_feature_0, last_feature_1, aux0, aux1, pos_stack_0, pos_stack_1, sampler_list
+    def concat_feat(self, inst_feat, indice):
+        c_f = []
+        for feat in inst_feat:
+            c_f.append(torch.concat(feat[indice], dim=0))
+        c_f = torch.concat(c_f, dim=-1)
+        return c_f
 
-        change_stack_down0, change_stack_down1, sem_stack_down_0, sem_stack_down_1, pos_stack_0, pos_stack_1 = [], [], [], [], [], []
-        aux0, aux1 = [], []
-        sampler_list = []
+    def change_branch(self, cd_stack_down_0, cd_stack_down_1, inst_feats0, inst_feats1):
+        diff_list_0, diff_list_1 = [], []
+        # Change Feature Extraction #
+        inst_feat0 = self.inst_concat_head[0](self.concat_feat(inst_feats0, 0))
+        inst_feat1 = self.inst_concat_head[0](self.concat_feat(inst_feats1, 0))
+        diff_init_0 = self.change_extraction(cd_stack_down_0, cd_stack_down_1, inst_feat0, inst_feat1, -1)
+        diff_init_1 = self.change_extraction(cd_stack_down_1, cd_stack_down_0, inst_feat1, inst_feat0, -1)
+        # End #
 
-        data0 = self.input0
-        data1 = self.input1
+        # 1、Change Extractor
+        for i, hlevel in enumerate(self.hlevels):
+            if i == len(self.hlevels) - 1:
+                break
+            inst_feat0 = self.inst_concat_head[hlevel + 1](self.concat_feat(inst_feats0, hlevel + 1))
+            inst_feat1 = self.inst_concat_head[hlevel + 1](self.concat_feat(inst_feats1, hlevel + 1))
+            diff_0 = self.change_extraction(cd_stack_down_0, cd_stack_down_1, inst_feat0, inst_feat1, -2 -hlevel)
+            diff_1 = self.change_extraction(cd_stack_down_1, cd_stack_down_0, inst_feat1, inst_feat0, -2 -hlevel)
+            diff_list_0.append(diff_0)
+            diff_list_1.append(diff_1)
 
-        #### Feature Encoder ####
-        data0 = self.down_modules[0](data0, precomputed=self.pre_computed)
-        data1 = self.down_modules[0](data1, precomputed=self.pre_computed_target)
-        nn_list0 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
-        diff0 = data0.clone()
-        diff0.x = data0.x - data1.x[nn_list0[1, :], :]
-        nn_list1 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        diff1 = data1.clone()
-        diff1.x = data1.x - data0.x[nn_list1[1, :], :]
-        sem_stack_down_0.append(data0.clone())
-        sem_stack_down_1.append(data1.clone())
-        pos_stack_0.append(data0.clone())
-        pos_stack_1.append(data1.clone())
-        change_stack_down0.append(diff0)
-        change_stack_down1.append(diff1)
+        # 2、Change Interpolation
+        diff_list_0.reverse()
+        diff_list_1.reverse()
+        change_0 = self.change_decoder(diff_init_0, diff_list_0)
+        change_1 = self.change_decoder(diff_init_1, diff_list_1)
 
-        for i in range(1, len(self.down_modules) - 1):
-            data0 = self.down_modules[i](data0, precomputed=self.pre_computed)
-            data1 = self.down_modules[i](data1, precomputed=self.pre_computed_target)
-            nn_list0 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
-            diff0 = data0.clone()
-            diff0.x = data0.x - data1.x[nn_list0[1, :], :]
-            nn_list1 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-            diff1 = data1.clone()
-            diff1.x = data1.x - data0.x[nn_list1[1, :], :]
-            sem_stack_down_0.append(data0.clone())
-            sem_stack_down_1.append(data1.clone())
-            pos_stack_0.append(data0.clone())
-            pos_stack_1.append(data1.clone())
-            change_stack_down0.append(diff0)
-            change_stack_down1.append(diff1)
-            for sampler in self.down_modules[i].sampler:
-                if sampler is not None:
-                    sampler_list.append(sampler)
+        return change_0, change_1
 
-        # 1024
-        data0 = self.down_modules[-1](data0, precomputed=self.pre_computed)
-        data1 = self.down_modules[-1](data1, precomputed=self.pre_computed_target)
+    def inst_change_extraction(self, change_feat, inst_feat):
+        diff_w_1 = self.change_activation(inst_feat)#.permute((1, 0)))
+        diff_f_1 = diff_w_1 * change_feat
+        return diff_f_1
 
-        for sampler in self.down_modules[-1].sampler:
-            if sampler is not None:
-                sampler_list.append(sampler)
+    def inst_change_extraction_v2(self, data1, data0, inst_feat1, inst_feat0, conv_indice):
+        nn_list = knn(data0[conv_indice].pos, data1[conv_indice].pos, 1, data0[conv_indice].batch, data1[conv_indice].batch)
+        diff_feat = inst_feat1 - inst_feat0[nn_list[1, :], :]
+        return diff_feat
 
-        #### Sem Decoder ####
-        sem_data_0 = data0.clone()
-        sem_data_1 = data1.clone()
-        pos_stack_0.append(data0.clone())
-        pos_stack_1.append(data1.clone())
-        aux0.append(data0.clone())
-        aux1.append(data1.clone())
-        innermost = False
-
-        if not isinstance(self.inner_modules[0], Identity):
-            sem_stack_down_0.append(data0)
-            sem_stack_down_1.append(data1)
-            sem_data_0 = self.inner_modules[0](sem_data_0)
-            sem_data_1 = self.inner_modules[0](sem_data_1)
-            innermost = True
-        for i in range(len(self.up_sem_modules)):
-            if i == 0 and innermost:
-                sem_data_0 = self.up_sem_modules[i]((sem_data_0, sem_stack_down_0.pop()))
-                sem_data_1 = self.up_sem_modules[i]((sem_data_1, sem_stack_down_1.pop()))
-                aux0.append(sem_data_0.clone())
-                aux1.append(sem_data_1.clone())
-            else:
-                sem_data_0 = self.up_sem_modules[i]((sem_data_0, sem_stack_down_0.pop()), precomputed=self.upsample_target)
-                sem_data_1 = self.up_sem_modules[i]((sem_data_1, sem_stack_down_1.pop()), precomputed=self.upsample_target)
-                aux0.append(sem_data_0.clone())
-                aux1.append(sem_data_1.clone())
-
-        last_feature_0 = sem_data_0.x
-        last_feature_1 = sem_data_1.x
-
-        nn_list0 = knn(data1.pos, data0.pos, 1, data1.batch, data0.batch)
-        change_data0 = data0.clone()
-        change_data0.x = data0.x - data1.x[nn_list0[1, :], :]
-        nn_list1 = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        change_data1 = data1.clone()
-        change_data1.x = data1.x - data0.x[nn_list1[1, :], :]
-        innermost = False
-        if not isinstance(self.inner_modules[0], Identity):
-            change_stack_down.append(data1)
-            change_data0 = self.inner_modules[0](change_data0)
-            change_data1 = self.inner_modules[0](change_data1)
-            innermost = True
-        for i in range(len(self.up_change_modules)):
-            if i == 0 and innermost:
-                change_data0 = self.up_change_modules[i]((change_data0, change_stack_down0.pop()))
-                change_data1 = self.up_change_modules[i]((change_data1, change_stack_down1.pop()))
-            else:
-                change_data0 = self.up_change_modules[i]((change_data0, change_stack_down0.pop()), precomputed=self.upsample_target)
-                change_data1 = self.up_change_modules[i]((change_data1, change_stack_down1.pop()), precomputed=self.upsample_target)
-        last_c_feature0 = change_data0.x
-        last_c_feature1 = change_data1.x
-        if self._use_category:
-            self.change_output0 = self.change_FC_layer(last_c_feature0, self.category)
-            self.change_output1 = self.change_FC_layer(last_c_feature1, self.category)
-        else:
-            self.change_output0 = self.change_FC_layer(last_c_feature0)
-            self.change_output1 = self.change_FC_layer(last_c_feature1)
-        return last_feature_0, last_feature_1, aux0, aux1, pos_stack_0, pos_stack_1, sampler_list
+    def change_extraction(self, data1, data0, inst_feat1, inst_feat0, conv_indice):
+        diff = data1[conv_indice].clone()
+        diff_feat = diff.x
+        inst_change_1 = self.inst_change_extraction(diff_feat, inst_feat1)
+        diff_init_1 = torch.concat([diff_feat, inst_change_1], dim=-1)
+        diff.x = diff_init_1
+        return diff
 
     def charge(self, list1, list2):
         for i, _ in enumerate(list1):
@@ -742,11 +720,13 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
 
         predictions_class = []
         predictions_mask = []
+        inst_feats = []
         for decoder_counter in range(self.num_decoders):
             if self.shared_decoder:
                 decoder_counter = 0
+            inst_feat_per_decoder = []
             for i, hlevel in enumerate(self.hlevels):
-                output_class, outputs_mask, attn_mask = self.mask_module(
+                output_class, outputs_mask, attn_mask, inst_feat = self.mask_module(
                     queries,
                     mask_features,
                     len(aux) - hlevel - 1,
@@ -756,30 +736,11 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                 )
 
                 decomposed_aux = self.decompose(aux[hlevel].x, batch_l[hlevel])
-                decomposed_attn = attn_mask #self.decompose(attn_mask, batch_l[hlevel])
-
-                # flag = self.charge(decomposed_aux, decomposed_attn)
-
-                # curr_sample_size = max(
-                #     [pcd.shape[0] for pcd in decomposed_aux]
-                # )
-                #
-                # if min([pcd.shape[0] for pcd in decomposed_aux]) == 1:
-                #     raise RuntimeError(
-                #         "only a single point gives nans in cross-attention"
-                #     )
-                #
-                # if not (self.max_sample_size or is_eval):
-                #     curr_sample_size = min(
-                #         curr_sample_size, self.sample_sizes[hlevel]
-                #     )
+                decomposed_attn = attn_mask
 
                 curr_sample_size = np.sort(
                     [pcd.shape[0] for pcd in decomposed_aux]
                 )[int(len(decomposed_aux) / 2)]
-                # # curr_sample_size = int(np.median(
-                # #     [pcd.shape[0] for pcd in decomposed_aux]
-                # # ))
 
                 if min([pcd.shape[0] for pcd in decomposed_aux]) == 1:
                     raise RuntimeError(
@@ -789,11 +750,8 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                 rand_idx = []
                 mask_idx = []
                 for k in range(len(decomposed_aux)):
-                    # pcd_size = decomposed_aux[k].shape[0]
                     pcd_size = min(decomposed_aux[k].shape[0], decomposed_attn[k].shape[0])
                     if pcd_size <= curr_sample_size:
-                        # we do not need to sample
-                        # take all points and pad the rest with zeroes and mask it
                         idx = torch.zeros(
                             curr_sample_size,
                             dtype=torch.long,
@@ -812,10 +770,6 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
 
                         midx[:pcd_size] = False  # attend to first points
                     else:
-                        # we have more points in pcd as we like to sample
-                        # take a subset (no padding or masking needed)
-                        # if flag:
-                        #     print("pcd_size > curr_sample_size")
                         idx = torch.randperm(
                             pcd_size, device=queries.device
                         )[:curr_sample_size]
@@ -835,16 +789,12 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                     ]
                 )
 
-                # print("batched_aux 1- {}: {}".format(hlevel, batched_aux))
-
                 batched_attn = torch.stack(
                     [
                         decomposed_attn[k][rand_idx[k], :]
                         for k in range(len(rand_idx))
                     ]
                 )
-
-                # print("batched_attn 1- {}: {}".format(hlevel, batched_attn))
 
                 batched_pos_enc = torch.stack(
                     [
@@ -853,13 +803,9 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                     ]
                 )
 
-                # print("batched_pos_enc 1- {}: {}".format(hlevel, batched_pos_enc))
-
                 batched_attn.permute((0, 2, 1))[
                     batched_attn.sum(1) == rand_idx[0].shape[0]
                     ] = False
-
-                # print("batched_attn 1- {}: {}".format(hlevel, batched_attn))
 
                 m = torch.stack(mask_idx)
                 batched_attn = torch.logical_or(batched_attn, m[..., None])
@@ -870,17 +816,19 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
                 if self.use_level_embed:
                     src_pcd += self.level_embed.weight[i]
 
+                # cross-attention
                 output = self.cross_attention[decoder_counter][i](
                     queries.permute((1, 0, 2)),
                     src_pcd,
                     memory_mask=batched_attn.repeat_interleave(
                         self.num_heads, dim=0
                     ).permute((0, 2, 1)),
-                    memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                    memory_key_padding_mask=None,
                     pos=batched_pos_enc.permute((1, 0, 2)),
                     query_pos=query_pos,
                 )
 
+                # self-attention
                 output = self.self_attention[decoder_counter][i](
                     output,
                     tgt_mask=None,
@@ -895,8 +843,10 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
 
                 predictions_class.append(output_class)
                 predictions_mask.append(outputs_mask)
+                inst_feat_per_decoder.append(inst_feat)
+            inst_feats.append(inst_feat_per_decoder)
 
-        output_class, outputs_mask = self.mask_module(
+        output_class, outputs_mask, inst_feat = self.mask_module(
             queries,
             mask_features,
             0,
@@ -914,7 +864,7 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
             "aux_outputs": self._set_aux_loss(
                 predictions_class, predictions_mask
             )
-        }
+        }, inst_feats
 
     def _set_aux_loss(self, outputs_class, outputs_seg_masks):
         return [
@@ -923,99 +873,11 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         ]
 
     def forward(self, *args, **kwargs) -> Any:
-        # """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
-        # change_stack_down, sem_stack_down_0, sem_stack_down_1 = [], [], []
-        #
-        # data0 = self.input0
-        # data1 = self.input1
-        #
-        # #### Feature Encoder ####
-        # data0 = self.down_modules[0](data0, precomputed=self.pre_computed)
-        # data1 = self.down_modules[0](data1, precomputed=self.pre_computed_target)
-        # nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        # diff = data1.clone()
-        # diff.x = data1.x - data0.x[nn_list[1, :], :]
-        # sem_stack_down_0.append(data0.clone())
-        # sem_stack_down_1.append(data1.clone())
-        # change_stack_down.append(diff)
-        #
-        # for i in range(1, len(self.down_modules) - 1):
-        #     data0 = self.down_modules[i](data0, precomputed=self.pre_computed)
-        #     data1 = self.down_modules[i](data1, precomputed=self.pre_computed_target)
-        #     nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        #     diff = data1.clone()
-        #     diff.x = data1.x - data0.x[nn_list[1, :], :]
-        #     sem_stack_down_0.append(data0.clone())
-        #     sem_stack_down_1.append(data1.clone())
-        #     change_stack_down.append(diff)
-        #
-        # #1024
-        # data0 = self.down_modules[-1](data0, precomputed=self.pre_computed)
-        # data1 = self.down_modules[-1](data1, precomputed=self.pre_computed_target)
-        #
-        # #### Sem Decoder ####
-        # sem_dec = []
-        # sem_data_0 = data0.clone()
-        # sem_data_1 = data1.clone()
-        # innermost = False
-        #
-        # nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        # data = data1.clone()
-        # data.x = data1.x - data0.x[nn_list[1,:],:]
-        #
-        # if not isinstance(self.inner_modules[0], Identity):
-        #     sem_stack_down_0.append(data0)
-        #     sem_stack_down_1.append(data1)
-        #     sem_data_0 = self.inner_modules[0](sem_data_0)
-        #     sem_data_1 = self.inner_modules[0](sem_data_1)
-        #     innermost = True
-        # for i in range(len(self.up_sem_modules)):
-        #     if i == 0 and innermost:
-        #         sem_data_0 = self.up_sem_modules[i]((sem_data_0, sem_stack_down_0.pop()))
-        #         sem_data_1 = self.up_sem_modules[i]((sem_data_1, sem_stack_down_1.pop()))
-        #         # nn_list = knn(sem_data_0.pos, sem_data_1.pos, 1, sem_data_0.batch, sem_data_1.batch)
-        #         # diff = sem_data_1.clone()
-        #         # diff.x = sem_data_1.x - sem_data_0.x[nn_list[1, :], :]
-        #         # sem_dec.append(diff)
-        #     else:
-        #         sem_data_0 = self.up_sem_modules[i]((sem_data_0, sem_stack_down_0.pop()), precomputed=self.upsample_target)
-        #         sem_data_1 = self.up_sem_modules[i]((sem_data_1, sem_stack_down_1.pop()), precomputed=self.upsample_target)
-        #         # nn_list = knn(sem_data_0.pos, sem_data_1.pos, 1, sem_data_0.batch, sem_data_1.batch)
-        #         # diff = sem_data_1.clone()
-        #         # diff.x = sem_data_1.x - sem_data_0.x[nn_list[1, :], :]
-        #         # sem_dec.append(diff)
-        #
-        # last_feature_0 = sem_data_0.x
-        # last_feature_1 = sem_data_1.x
-        # if self._use_category:
-        #     self.sem_output0 = self.sem_FC_layer(last_feature_0, self.category)
-        #     self.sem_output1 = self.sem_FC_layer(last_feature_1, self.category)
-        # else:
-        #     self.sem_output0 = self.sem_FC_layer(last_feature_0)
-        #     self.sem_output1 = self.sem_FC_layer(last_feature_1)
-        # # sem_dec.reverse()
-        #
-        # #### Change Decoder ####
-        # innermost = False
-        # if not isinstance(self.inner_modules[0], Identity):
-        #     change_stack_down.append(data1)
-        #     data = self.inner_modules[0](data)
-        #     innermost = True
-        # for i in range(len(self.up_change_modules)):
-        #     if i == 0 and innermost:
-        #         data = self.up_change_modules[i]((data, change_stack_down.pop()))
-        #     else:
-        #         data = self.up_change_modules[i]((data, change_stack_down.pop()), precomputed=self.upsample_target)
-        # last_feature = data.x
-        # if self._use_category:
-        #     self.change_output = self.change_FC_layer(last_feature, self.category)
-        # else:
-        #     self.change_output = self.change_FC_layer(last_feature)
-
-        # 1、Feature Extraction Backbone
-
+        # 1、Encoder
         loss_weight = kwargs["loss_weight"]
-        pcd_feat0, pcd_feat1, aux0, aux1, pos0, pos1, sampler_list = self.backbone()
+        cd_stack_down_0, cd_stack_down_1, sem_stack_down_0, sem_stack_down_1, pos0, pos1, sampler_list = self.feat_encoder()
+        data0, data1 = sem_stack_down_0.pop(), sem_stack_down_1.pop()
+        pcd_feat0, pcd_feat1, aux0, aux1 = self.sem_decoder(data0, data1, pos0, pos1, sem_stack_down_0, sem_stack_down_1)
 
         # 2、Get Multilevel Encoded Pos
         pos0.reverse()
@@ -1028,83 +890,37 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
         batch_l1 = self.get_batch_id(aux1)
 
         # 4、Mask Branch
-        self.mask_output0 = self.mask_branch(pcd_feat0, aux0, enc_pos0, batch_l0, sampler_list, self.input0)
-        self.mask_output1 = self.mask_branch(pcd_feat1, aux1, enc_pos1, batch_l1, sampler_list, self.input1)
+        self.mask_output0, inst_feats0 = self.mask_branch(pcd_feat0, aux0, enc_pos0, batch_l0, sampler_list, self.input0)
+        self.mask_output1, inst_feats1 = self.mask_branch(pcd_feat1, aux1, enc_pos1, batch_l1, sampler_list, self.input1)
+
+        # 5、Change Branch
+        change0, change1 = self.change_branch(cd_stack_down_0, cd_stack_down_1, inst_feats0, inst_feats1)
+        self.change_output0 = change0
+        self.change_output1 = change1
 
         # 5、Get input labels
-        self.labels.append(self.decompose(pos0[-1].pos, batch_l0[-1]))
-        self.labels.append(self.decompose(pos1[-1].pos, batch_l1[-1]))
         self.labels.append(self.decompose(self.input0.inst_y, batch_l0[-1]))
         self.labels.append(self.decompose(self.input1.inst_y, batch_l1[-1]))
+        self.labels.append(self.decompose(self.input0.change_y, batch_l0[-1]))
+        self.labels.append(self.decompose(self.input1.change_y, batch_l1[-1]))
 
         if self.labels is not None:
             self.compute_loss(loss_weight)
 
-        self.data_visual = self.input1
-        self.data_visual.change_pred = torch.max(self.change_output, -1)[1]
-        self.output = [self.change_output, self.mask_output0, self.mask_output1]
+        self.data_visual0 = self.input0
+        self.data_visual0.change_pred0 = torch.max(self.change_output0, -1)[1]
+        self.data_visual1 = self.input1
+        self.data_visual1.change_pred1 = torch.max(self.change_output1, -1)[1]
+        self.output = [self.change_output0, self.change_output1, self.mask_output0, self.mask_output1,
+                       self.decompose(self.change_output0, batch_l0[-1]), self.decompose(self.change_output1, batch_l1[-1])]
 
-        return self.change_output, self.mask_output0, self.mask_output1
-        # """Run forward pass. This will be called by both functions <optimize_parameters> and <test>."""
-        # stack_down = []
-        #
-        # data0 = self.input0
-        # data1 = self.input1
-        #
-        # #### Feature Encoder ####
-        # data0 = self.down_modules_1[0](data0, precomputed=self.pre_computed)
-        # data1 = self.down_modules_2[0](data1, precomputed=self.pre_computed_target)
-        # nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        # diff = data1.clone()
-        # diff.x = data1.x - data0.x[nn_list[1, :], :]
-        # data1.x = torch.cat((data1.x, diff.x), axis=1)
-        # stack_down.append(data1)
-        #
-        # for i in range(1, len(self.down_modules_1) - 1):
-        #     data0 = self.down_modules_1[i](data0, precomputed=self.pre_computed)
-        #     data1 = self.down_modules_2[i](data1, precomputed=self.pre_computed_target)
-        #     nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        #     diff = data1.clone()
-        #     diff.x = data1.x - data0.x[nn_list[1,:],:]
-        #     data1.x = torch.cat((data1.x, diff.x), axis=1)
-        #     stack_down.append(data1)
-        # #1024
-        # data0 = self.down_modules_1[-1](data0, precomputed=self.pre_computed)
-        # data1 = self.down_modules_2[-1](data1, precomputed=self.pre_computed_target)
-        #
-        # nn_list = knn(data0.pos, data1.pos, 1, data0.batch, data1.batch)
-        # data = data1.clone()
-        # data.x = data1.x - data0.x[nn_list[1,:],:]
-        # data.x = torch.cat((data1.x, data.x), axis=1)
-        # innermost = False
-        # if not isinstance(self.inner_modules[0], Identity):
-        #     stack_down.append(data1)
-        #     data = self.inner_modules[0](data)
-        #     innermost = True
-        # for i in range(len(self.up_modules)):
-        #     if i == 0 and innermost:
-        #         data = self.up_modules[i]((data, stack_down.pop()))
-        #     else:
-        #         data = self.up_modules[i]((data, stack_down.pop()), precomputed=self.upsample_target)
-        # last_feature = data.x
-        # if self._use_category:
-        #     self.output = self.FC_layer(last_feature, self.category)
-        # else:
-        #     self.output = self.FC_layer(last_feature)
-        #
-        # if self.labels is not None:
-        #     self.compute_loss()
-        #
-        # self.data_visual = self.input1
-        # self.data_visual.pred = torch.max(self.output, -1)[1]
-        #
-        # return self.output
+        return self.change_output0, self.change_output1, self.mask_output0, self.mask_output1
 
     def compute_loss(self, loss_weight):
         if self.change_weight_classes is not None:
-            self.change_weight_classes = self.change_weight_classes.to(self.change_output.device)
+            self.change_weight_classes = self.change_weight_classes.to(self.change_output0.device)
         if self.inst_weight_classes is not None:
-            self.inst_weight_classes = self.inst_weight_classes.to(self.change_output.device)
+            self.inst_weight_classes = self.inst_weight_classes.to(self.change_output0.device)
         self.loss = 0
 
         # Get regularization on weights
@@ -1119,100 +935,53 @@ class SiamEncFusionSkipKPConv(UnwrappedUnetBasedModel):
 
         # 1、Change Loss
         if self._ignore_label is not None:
-            self.loss_seg = F.nll_loss(self.change_output, self.change_labels, weight=self.change_weight_classes, ignore_index=self._ignore_label)
+            self.loss_seg = F.nll_loss(self.change_output0, self.change_y, weight=self.change_weight_classes, ignore_index=self._ignore_label) + F.nll_loss(self.change_output1, self.change_y_target, weight=self.change_weight_classes, ignore_index=self._ignore_label)
         else:
-            self.loss_seg = F.nll_loss(self.change_output, self.change_labels, weight=self.change_weight_classes)
-
-        # # 1、Change Loss
-        # if self._ignore_label is not None:
-        #     self.loss_seg = F.nll_loss(self.change_output0, self.change_y, weight=self.change_weight_classes, ignore_index=self._ignore_label) + F.nll_loss(self.change_output1, self.change_y_target, weight=self.change_weight_classes, ignore_index=self._ignore_label)
-        # else:
-        #     self.loss_seg = F.nll_loss(self.change_output0, self.change_y, weight=self.change_weight_classes) + F.nll_loss(self.change_output1, self.change_y_target, weight=self.change_weight_classes)
-
-
-        # self.loss += self.loss_seg
+            self.loss_seg = F.nll_loss(self.change_output0, self.change_y, weight=self.change_weight_classes) + F.nll_loss(self.change_output1, self.change_y_target, weight=self.change_weight_classes)
 
         # 2、Mask Loss
-        mask_losses0 = self.set_criterion(
-            self.mask_output0, self.target_y, mask_type="masks"
-        )
-        mask_losses1 = self.set_criterion(
-            self.mask_output1, self.target_y_target, mask_type="masks"
-        )
+        mask_losses = {}
+        if len(self.target_y) != 0:
+            mask_losses0 = self.set_criterion(
+                self.mask_output0, self.target_y, mask_type="masks"
+            )
+            new_loss0 = {}
+            for k in list(mask_losses0.keys()):
+                if k in self.set_criterion.weight_dict:
+                    new_key = k + "_PC0"
+                    mask_losses0[k] *= self.set_criterion.weight_dict[k]
+                    new_loss0[new_key] = mask_losses0[k]
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    print("PC0 Not weight {}".format(k))
+                    mask_losses0.pop(k)
+            mask_losses.update(new_loss0)
+        if len(self.target_y_target) != 0:
+            mask_losses1 = self.set_criterion(
+                self.mask_output1, self.target_y_target, mask_type="masks"
+            )
+            new_loss1 = {}
+            for k in list(mask_losses1.keys()):
+                if k in self.set_criterion.weight_dict:
+                    new_key = k + "_PC1"
+                    mask_losses1[k] *= self.set_criterion.weight_dict[k]
+                    new_loss1[new_key] = mask_losses1[k]
+                else:
+                    # remove this loss if not specified in `weight_dict`
+                    print("PC1 Not weight {}".format(k))
+                    mask_losses1.pop(k)
+            mask_losses.update(new_loss1)
+        mask_loss = sum(mask_losses.values())
+        self.change_loss = loss_weight["change"] * self.loss_seg
+        self.mask_loss = loss_weight["inst"] * mask_loss
+        self.loss_all = self.change_loss  + self.mask_loss
+        # 加权Loss
+        lambda_c, lambda_i = 94.5, 1
+        self.change_loss = lambda_c * self.loss_seg
+        self.mask_loss = lambda_i * mask_loss
+        self.loss_all = self.change_loss  + self.mask_loss
 
-        new_loss0, new_loss1 = {}, {}
-        for k in list(mask_losses0.keys()):
-            if k in self.set_criterion.weight_dict:
-                new_key = k + "_PC0"
-                mask_losses0[k] *= self.set_criterion.weight_dict[k]
-                new_loss0[new_key] = mask_losses0[k]
-            else:
-                # remove this loss if not specified in `weight_dict`
-                print("PC0 Not weight {}".format(k))
-                mask_losses0.pop(k)
-        # print("change loss: {}".format(losses1["loss_variations"]))
-        for k in list(mask_losses1.keys()):
-            if k in self.set_criterion.weight_dict:
-                new_key = k + "_PC1"
-                mask_losses1[k] *= self.set_criterion.weight_dict[k]
-                new_loss1[new_key] = mask_losses1[k]
-            else:
-                # remove this loss if not specified in `weight_dict`
-                print("PC1 Not weight {}".format(k))
-                mask_losses1.pop(k)
-
-        losses = {}
-        losses.update(new_loss0)
-        losses.update(new_loss1)
-
-        # new_loss0, new_loss1 = {}, {}
-        # for k in list(mask_losses0.keys()):
-        #     if k in self.set_criterion.weight_dict:
-        #         new_key = k + "_PC0"
-        #         mask_losses0[k] *= self.set_criterion.weight_dict[k]
-        #         new_loss0[new_key] = mask_losses0[k]
-        #     else:
-        #         # remove this loss if not specified in `weight_dict`
-        #         print("PC0 Not weight {}".format(k))
-        #         new_loss0.pop(k)
-        #
-        # for k in list(mask_losses1.keys()):
-        #     if k in self.set_criterion.weight_dict:
-        #         new_key = k + "_PC1"
-        #         mask_losses1[k] *= self.set_criterion.weight_dict[k]
-        #         new_loss1[new_key] = mask_losses1[k]
-        #     else:
-        #         # remove this loss if not specified in `weight_dict`
-        #         print("PC1 Not weight {}".format(k))
-        #         mask_losses1.pop(k)
-        # losses = {}
-        # losses.update(new_loss0)
-        # losses.update(new_loss1)
-
-        mask_loss = sum(losses.values())
-        # loss_all = loss_weight["change"] * self.loss_seg + loss_weight["inst"] * mask_loss
-        # loss_all = 10 * self.loss_seg + 1.0 * mask_loss
-        change_loss = 250 * self.loss_seg
-        loss_all = change_loss  + 1.0 * mask_loss
-
-        print("All loss: {} Change loss: {} Mask loss: {}".format(loss_all, change_loss, mask_loss))
-        self.loss += loss_all
-        # self.loss += mask_loss
-
-        # if self._ignore_label is not None:
-        #     sem_loss_0 = F.nll_loss(self.sem_output0, self.sem_labels, weight=self.sem_weight_classes, ignore_index=self._ignore_label)
-        #     sem_loss_1 = F.nll_loss(self.sem_output1, self.sem_labels_target, weight=self.sem_weight_classes, ignore_index=self._ignore_label)
-        # else:
-        #     sem_loss_0 = F.nll_loss(self.sem_output0, self.sem_labels, weight=self.sem_weight_classes)
-        #     sem_loss_1 = F.nll_loss(self.sem_output1, self.sem_labels_target, weight=self.sem_weight_classes)
-        #
-        # if torch.isnan(sem_loss_0).sum() == 1:
-        #     print(sem_loss_0)
-        # if torch.isnan(sem_loss_1).sum() == 1:
-        #     print(sem_loss_1)
-        #
-        # self.loss += sem_loss_0
-        # self.loss += sem_loss_1
+        self.loss += self.loss_all
 
     def backward(self):
         """Calculate losses, gradients, and update network weights; called in every training iteration"""
@@ -1446,4 +1215,3 @@ def _get_activation_fn(activation):
     if activation == "glu":
         return F.glu
     raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
-#################### ATTENTION ####################

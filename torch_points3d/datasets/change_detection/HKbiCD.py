@@ -1,40 +1,23 @@
 import os
 import os.path as osp
-from itertools import repeat, product
 import numpy as np
-import h5py
 import torch
 import random
-import glob
-import csv
+
 from plyfile import PlyData, PlyElement
-from torch_geometric.data import Data, extract_zip, Dataset
-from torch_geometric.data.dataset import files_exist
-from torch_geometric.data import DataLoader
-import torch_geometric.transforms as T
-import logging
-from sklearn.neighbors import NearestNeighbors, KDTree
-from tqdm.auto import tqdm as tq
-import csv
-import pandas as pd
+from torch_geometric.data import Data, Dataset
+from sklearn.neighbors import KDTree
 import pickle
-import gdown
-import shutil
 
 from torch_points3d.core.data_transform import GridSampling3D, CylinderSampling, SphereSampling
 from torch_points3d.datasets.change_detection.base_siamese_dataset import BaseSiameseDataset
 from torch_points3d.datasets.change_detection.pair import Pair, MultiScalePair
-from torch_points3d.metrics.change_detection_tracker import CDTracker
-from torch_points3d.metrics.urb3DiCD_tracker import Urb3DiCDTracker
-
-import matplotlib.pyplot as plt
+from torch_points3d.metrics.hkbiCD_tracker import hkbiCDTracker
 from matplotlib import cm
-from matplotlib.colors import ListedColormap, LinearSegmentedColormap
 
 IGNORE_LABEL: int = -1
-
-URB3DCD_CHANGE_CLASSES = 3
-change_viridis = cm.get_cmap('viridis', URB3DCD_CHANGE_CLASSES)
+HKCD_CHANGE_CLASSES = 2
+change_viridis = cm.get_cmap('viridis', HKCD_CHANGE_CLASSES)
 
 INV_CHANGE_LABEL = {
     0: "unchanged",
@@ -51,8 +34,8 @@ CHANGE_COLOR = np.asarray(
 )
 CHANGE_LABEL = {name: i for i, name in INV_CHANGE_LABEL.items()}
 
-URB3DCD_SEM_CLASSES = 2
-sem_viridis = cm.get_cmap('viridis', URB3DCD_CHANGE_CLASSES)
+HKCD_SEM_CLASSES = 2
+sem_viridis = cm.get_cmap('viridis', HKCD_CHANGE_CLASSES)
 
 INV_SEM_LABEL = {
     0: "ground",
@@ -67,14 +50,14 @@ SEM_COLOR = np.asarray(
 )
 SEM_LABEL = {name: i for i, name in INV_SEM_LABEL.items()}
 
-class Urb3DSimul(Dataset):
+class HKCDSimul(Dataset):
     """
-    Definition of Urb3DCD Dataset
+    Definition of AHNCD Dataset
     """
 
     def __init__(self, sample_per_epoch=6000, filePaths="", split="train", DA=False, pre_transform=None, transform=None, preprocessed_dir="",
                  reload_preproc=False, reload_trees=False, nameInPly="params", comp_norm = False ):
-        super(Urb3DSimul, self).__init__(None, None, pre_transform)
+        super(HKCDSimul, self).__init__(None, None, pre_transform)
         self.change_labels = CHANGE_LABEL
         self.sem_labels = SEM_LABEL
         self._ignore_label = IGNORE_LABEL
@@ -91,8 +74,8 @@ class Urb3DSimul(Dataset):
         self.manual_transform = transform
         self.reload_preproc = reload_preproc
         self.reload_trees = reload_trees
-        self.change_classes = URB3DCD_CHANGE_CLASSES
-        self.sem_classes = URB3DCD_SEM_CLASSES
+        self.change_classes = HKCD_CHANGE_CLASSES
+        self.sem_classes = HKCD_SEM_CLASSES
         self.change_nb_elt_class = torch.zeros(self.change_classes)
         self.inst_nb_elt_class = torch.zeros(self.sem_classes)
         self.filesPC0_prepoc = [None] * len(self.filesPC0)
@@ -150,14 +133,6 @@ class Urb3DSimul(Dataset):
             for c in range(cpt.shape[0]):
                 self.inst_nb_elt_class[c] += cpt[c]
 
-    # def get_nb_elt_class(self):
-    #     self.nb_elt_class = torch.zeros(self.change_classes)
-    #     for idx in range(len(self.filesPC0)):
-    #         pc1 = torch.load(osp.join(self.preprocessed_dir, 'pc1_{}.pt'.format(idx)))
-    #         cpt = torch.bincount(pc1.y)
-    #         for c in range(cpt.shape[0]):
-    #             self.nb_elt_class[c] += cpt[c]
-
     def hand_craft_process(self,comp_normal=False):
         existfile = True
         for idx in range(len(self.filesPC0)):
@@ -165,17 +140,17 @@ class Urb3DSimul(Dataset):
             exist_file = existfile and osp.isfile(osp.join(self.preprocessed_dir, 'pc1_{}.pt'.format(idx)))
         if not self.reload_preproc or not exist_file:
             for idx in range(len(self.filesPC0)):
-                pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self.clouds_loader(idx, nameInPly=self.nameInPly)
-                pc0 = Data(pos=pc0, sem_y=sem_label0, inst_y=inst_label0)
-                pc1 = Data(pos=pc1, sem_y=sem_label1, inst_y=inst_label1, change_y=change_label)
+                pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self.clouds_loader(idx, nameInPly=self.nameInPly)
+                pc0 = Data(pos=pc0, rgb=rgb0, sem_y=sem_label0, inst_y=inst_label0, change_y=change_label0)
+                pc1 = Data(pos=pc1, rgb=rgb1, sem_y=sem_label1, inst_y=inst_label1, change_y=change_label1)
                 if comp_normal:
                     normal0 = getFeaturesfromPDAL(pc0.pos.numpy())
                     pc0.norm = torch.from_numpy(normal0)
                     normal1 = getFeaturesfromPDAL(pc1.pos.numpy())
                     pc1.norm = torch.from_numpy(normal1)
-                if self.pre_transform is not None:
-                    pc0 = self.pre_transform(pc0)
-                    pc1 = self.pre_transform(pc1)
+                # if self.pre_transform is not None:
+                #     pc0 = self.pre_transform(pc0)
+                #     pc1 = self.pre_transform(pc1)
                 # cpt = torch.bincount(pc0.y[:, -1])
                 # for c in range(cpt.shape[0]):
                 #     self.nb_elt_class[c] += cpt[c]
@@ -201,13 +176,13 @@ class Urb3DSimul(Dataset):
 
     def get(self, idx):
         if self.pre_transform is not None:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self._preproc_clouds_loader(idx)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self._preproc_clouds_loader(idx)
         else:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self.clouds_loader(idx, nameInPly=self.nameInPly)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self.clouds_loader(idx, nameInPly=self.nameInPly)
         if (hasattr(pc0, "multiscale")):
-            batch = MultiScalePair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y_target=change_label)
+            batch = MultiScalePair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y=change_label0, change_y_target=change_label1)
         else:
-            batch = Pair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y_target=change_label)
+            batch = Pair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y=change_label0, change_y_target=change_label1)
             batch.normalise()
         return batch.contiguous()
 
@@ -215,20 +190,23 @@ class Urb3DSimul(Dataset):
         print("Loading " + self.filesPC1[area])
         pc = self.cloud_loader(self.filesPC1[area], nameInPly=nameInPly)
         pc1 = pc[:, :3] # pc[:, :3]
-        sem_gt1 = pc[:, 3].long() #pc[:, 3].long() #/!\ Labels should be at the 4th column 0:X 1:Y 2:Z 3:LAbel
-        inst_gt1 = pc[:, 4].long()
-        change_gt1 = pc[:, 5].long()
+        rgb1 = pc[:, 3:6]
+        sem_gt1 = pc[:, 6].long() #pc[:, 3].long() #/!\ Labels should be at the 4th column 0:X 1:Y 2:Z 3:LAbel
+        inst_gt1 = pc[:, 7].long()
+        change_gt1 = pc[:, 8].long()
         pc = self.cloud_loader(self.filesPC0[area], nameInPly=nameInPly) # self.cloud_loader(self.filesPC0[area], nameInPly=nameInPly)[:, :3]
         pc0 = pc[:, :3] # pc[:, :3]
-        sem_gt0 = pc[:, 3].long() #pc[:, 3].long() #/!\ Labels should be at the 4th column 0:X 1:Y 2:Z 3:LAbel
-        inst_gt0 = pc[:, 4].long()
+        rgb0 = pc[:, 3:6]
+        sem_gt0 = pc[:, 6].long() #pc[:, 3].long() #/!\ Labels should be at the 4th column 0:X 1:Y 2:Z 3:LAbel
+        inst_gt0 = pc[:, 7].long()
+        change_gt0 = pc[:, 8].long()
 
-        return pc0.type(torch.float), pc1.type(torch.float), sem_gt0, sem_gt1, inst_gt0, inst_gt1, change_gt1
+        return pc0.type(torch.float), pc1.type(torch.float), rgb0.type(torch.float), rgb1.type(torch.float), sem_gt0, sem_gt1, inst_gt0, inst_gt1, change_gt0, change_gt1
 
     def _preproc_clouds_loader(self, area):
         data_pc0 = torch.load(osp.join(self.preprocessed_dir, 'pc0_{}.pt'.format(area)))
         data_pc1 = torch.load(osp.join(self.preprocessed_dir, 'pc1_{}.pt'.format(area)))
-        return data_pc0.pos, data_pc1.pos, data_pc0.sem_y, data_pc1.sem_y, data_pc0.inst_y, data_pc1.inst_y, data_pc1.change_y
+        return data_pc0.pos, data_pc1.pos, data_pc0.rgb, data_pc1.rgb, data_pc0.sem_y, data_pc1.sem_y, data_pc0.inst_y, data_pc1.inst_y, data_pc0.change_y, data_pc1.change_y
 
     def read_from_ply(self,filename, nameInPly="params", name_feat="label_ch"):
         """read XYZ for each vertex."""
@@ -236,13 +214,18 @@ class Urb3DSimul(Dataset):
         with open(filename, "rb") as f:
             plydata = PlyData.read(f)
             num_verts = plydata[nameInPly].count
-            vertices = np.zeros(shape=[num_verts, 6], dtype=np.float32)
+            vertices = np.zeros(shape=[num_verts, 9], dtype=np.float32)
             vertices[:, 0] = plydata[nameInPly].data["x"]
             vertices[:, 1] = plydata[nameInPly].data["y"]
             vertices[:, 2] = plydata[nameInPly].data["z"]
-            vertices[:, 3] = plydata[nameInPly].data["scalar_label_mono"]
-            vertices[:, 4] = plydata[nameInPly].data["scalar_instance"]
-            vertices[:, 5] = plydata[nameInPly].data["scalar_label_ch"]
+
+            vertices[:, 3] = plydata[nameInPly].data["red"]
+            vertices[:, 4] = plydata[nameInPly].data["green"]
+            vertices[:, 5] = plydata[nameInPly].data["blue"]
+
+            vertices[:, 6] = plydata[nameInPly].data["scalar_class"]
+            vertices[:, 7] = plydata[nameInPly].data["scalar_instance"]
+            vertices[:, 8] = plydata[nameInPly].data["scalar_cd_type"]
         return vertices
 
 
@@ -271,8 +254,8 @@ class Urb3DSimul(Dataset):
     def num_features(self):
         return 6
 
-class Urb3DSimulSphere(Urb3DSimul):
-    """ Small variation of Urb3DCD that allows random sampling of spheres
+class HKCDSphere(HKCDSimul):
+    """ Small variation of AHNCD that allows random sampling of spheres
     within an Area during training and validation. Spheres have a radius of 2m. If sample_per_epoch is not specified, spheres
     are taken on a 2m grid.
 
@@ -353,8 +336,14 @@ class Urb3DSimulSphere(Urb3DSimul):
 
     def _get_random(self):
         # Random spheres biased towards getting more low frequency classes
-        chosen_label = 1.0 #np.random.choice(self._labels, p=self._label_counts)
-        valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
+        if random.random() < 0.5:
+            chosen_label = 1 #np.random.choice(self._i_labels, p=self._i_label_counts)
+            valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
+        else:
+            chosen_label = 1 #np.random.choice(self._c_labels, p=self._c_label_counts)
+            valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, -1] == chosen_label]
+        # chosen_label = 1.0 #np.random.choice(self._labels, p=self._label_counts)
+        # valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
         centre_idx = int(random.random() * (valid_centres.shape[0] - 1))
         centre = valid_centres[centre_idx]
         #  choice of the corresponding PC if several PCs are loaded
@@ -376,7 +365,9 @@ class Urb3DSimulSphere(Urb3DSimul):
 
     def _prepare_centers(self):
         self._centres_for_sampling = []
-        grid_sampling = GridSampling3D(size=self._radius / 2)
+        # grid_sampling = GridSampling3D(size=self._radius / 2)
+        grid_sampling = GridSampling3D(size=self._radius)
+
         self.grid_regular_centers = []
         for i in range(len(self.filesPC0)):
             pair = self._load_save(i)
@@ -399,15 +390,48 @@ class Urb3DSimulSphere(Urb3DSimul):
                 centres[:, 3] = i
                 self.grid_regular_centers.append(centres)
 
+        # if self._sample_per_epoch > 0:
+        #     self._centres_for_sampling = torch.cat(self._centres_for_sampling, 0)
+        #     uni, uni_counts = np.unique(np.asarray(self._centres_for_sampling[:, 4]), return_counts=True)
+        #     print(uni_counts)
+        #     uni_counts = np.sqrt(uni_counts.mean() / uni_counts)
+        #     self._label_counts = uni_counts / np.sum(uni_counts)
+        #     print(self._label_counts)
+        #     self._labels = uni
+        #     self.weight_classes = torch.from_numpy(self._label_counts).type(torch.float)
+        #     if self.fix_cyl:
+        #         self._centres_for_sampling_fixed = []
+        #         # choice of cylinders for all the training
+        #         np.random.seed(1)
+        #         chosen_labels = np.random.choice(self._labels, p=self._label_counts, size=(self._sample_per_epoch, 1))
+        #         uni, uni_counts = np.unique(chosen_labels, return_counts=True)
+        #         print("fixed cylinder", uni, uni_counts)
+        #         for c in range(uni.shape[0]):
+        #             valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == uni[c]]
+        #             centres_idx = np.random.randint(low = 0, high=valid_centres.shape[0], size=(uni_counts[c],1))
+        #             self._centres_for_sampling_fixed.append(np.squeeze(valid_centres[centres_idx,:], axis=1))
+        #         self._centres_for_sampling_fixed = torch.cat(self._centres_for_sampling_fixed, 0)
+        # else:
+        #     self.grid_regular_centers = torch.cat(self.grid_regular_centers, 0)
+
         if self._sample_per_epoch > 0:
             self._centres_for_sampling = torch.cat(self._centres_for_sampling, 0)
-            uni, uni_counts = np.unique(np.asarray(self._centres_for_sampling[:, 4]), return_counts=True)
-            print(uni_counts)
-            uni_counts = np.sqrt(uni_counts.mean() / uni_counts)
-            self._label_counts = uni_counts / np.sum(uni_counts)
-            print(self._label_counts)
-            self._labels = uni
-            self.weight_classes = torch.from_numpy(self._label_counts).type(torch.float)
+            i_uni, i_uni_counts = np.unique(np.asarray(self._centres_for_sampling[:, 4]), return_counts=True)
+            print(i_uni_counts)
+            i_uni_counts = np.sqrt(i_uni_counts.mean() / i_uni_counts)
+            self._i_label_counts = i_uni_counts / np.sum(i_uni_counts)
+            print(self._i_label_counts)
+            self._i_labels = i_uni
+            self.i_weight_classes = torch.from_numpy(self._i_label_counts).type(torch.float)
+
+            c_uni, c_uni_counts = np.unique(np.asarray(self._centres_for_sampling[:, -1]), return_counts=True)
+            print(c_uni_counts)
+            c_uni_counts = np.sqrt(c_uni_counts.mean() / c_uni_counts)
+            self._c_label_counts = c_uni_counts / np.sum(c_uni_counts)
+            print(self._c_label_counts)
+            self._c_labels = c_uni
+            self.c_weight_classes = torch.from_numpy(self._c_label_counts).type(torch.float)
+
             if self.fix_cyl:
                 self._centres_for_sampling_fixed = []
                 # choice of cylinders for all the training
@@ -425,10 +449,10 @@ class Urb3DSimulSphere(Urb3DSimul):
 
     def _load_save(self, i):
         if self.pre_transform is not None:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self._preproc_clouds_loader(i)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self._preproc_clouds_loader(i)
         else:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self.clouds_loader(i, nameInPly=self.nameInPly)
-        pair = Pair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y_target=change_label)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self.clouds_loader(i, nameInPly=self.nameInPly)
+        pair = Pair(pos=pc0, pos_target=pc1, rgb=rgb0, rgb_target=rgb1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y=change_label0, change_y_target=change_label1)
         path = self.filesPC0[i]
         name_tree = os.path.basename(path).split(".")[0] + "_radius" + str(int(self._radius)) + "_" + str(i) + ".p"
         path_treesPC0 = os.path.join(self.preprocessed_dir, "tp3DTree", name_tree)  # osp.dirname(path)
@@ -468,8 +492,7 @@ class Urb3DSimulSphere(Urb3DSimul):
             pair.KDTREE_KEY_PC1 = tree
         return pair
 
-
-class Urb3DSimulCylinder(Urb3DSimulSphere):
+class HKCDCylinder(HKCDSphere):
     def get(self, idx):
         if self._sample_per_epoch > 0:
             if self.fix_cyl:
@@ -479,15 +502,29 @@ class Urb3DSimulCylinder(Urb3DSimulSphere):
                     area_sel = self._centres_for_sampling_fixed[idx, 3].int()  # ---> ici choix du pc correspondant si pls pc chargés
                     pair = self._load_save(area_sel)
                     cylinder_sampler = CylinderSampling(self._radius, centre, align_origin=False)
-                    dataPC0 = Data(pos=pair.pos, idx=torch.arange(pair.pos.shape[0]).reshape(-1), sem_y=pair.sem_y, inst_y=pair.inst_y)
+                    dataPC0 = Data(pos=pair.pos, rgb=pair.rgb, idx=torch.arange(pair.pos.shape[0]).reshape(-1), sem_y=pair.sem_y, inst_y=pair.inst_y, change_y=pair.change_y)
                     setattr(dataPC0, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC0)
-                    dataPC1 = Data(pos=pair.pos_target, idx=torch.arange(pair.pos_target.shape[0]).reshape(-1), sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y_target=pair.change_y_target)
+                    dataPC1 = Data(pos=pair.pos_target, rgb=pair.rgb_target, idx=torch.arange(pair.pos_target.shape[0]).reshape(-1), sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y=pair.change_y_target)
                     setattr(dataPC1, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC1)
-                    dataPC0_cyl = cylinder_sampler(dataPC0)
-                    dataPC1_cyl = cylinder_sampler(dataPC1)
+                    full_dataPC0_cyl = cylinder_sampler(dataPC0)
+                    full_dataPC1_cyl = cylinder_sampler(dataPC1)
+                    if self.pre_transform is not None:
+                        dataPC0_cyl = self.pre_transform(full_dataPC0_cyl.clone())
+                        dataPC1_cyl = self.pre_transform(full_dataPC1_cyl.clone())
+                    else:
+                        dataPC0_cyl = full_dataPC0_cyl
+                        dataPC1_cyl = full_dataPC1_cyl
                     pair_cylinders = Pair(pos=dataPC0_cyl.pos, pos_target=dataPC1_cyl.pos, sem_y=dataPC0_cyl.sem_y, sem_y_target=dataPC1_cyl.sem_y,
-                                          inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y_target=dataPC1_cyl.change_y_target,
-                                          idx=dataPC0_cyl.idx, idx_target=dataPC1_cyl.idx, area=area_sel)
+                                          inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y=dataPC0_cyl.change_y, change_y_target=dataPC1_cyl.change_y,
+                                          sample_ori_pos=dataPC0_cyl.pos.clone(),
+                                          sample_ori_pos_target=dataPC1_cyl.pos.clone(),
+                                          full_pos=full_dataPC0_cyl.pos, full_pos_target=full_dataPC1_cyl.pos,
+                                          full_rgb=full_dataPC0_cyl.rgb.clone(),
+                                          full_rgb_target=full_dataPC1_cyl.rgb.clone(),
+                                          full_sem_y=full_dataPC0_cyl.sem_y, full_sem_y_target=full_dataPC1_cyl.sem_y,
+                                          full_inst_y=full_dataPC0_cyl.inst_y,
+                                          full_inst_y_target=full_dataPC1_cyl.inst_y,full_change_y=full_dataPC0_cyl.change_y, full_change_y_target=full_dataPC1_cyl.change_y,
+                                          idx=dataPC0_cyl.idx, idx_target=dataPC1_cyl.idx, area=area_sel, file_names=self.filesPC0[area_sel])
                     try:
                         pair_cylinders.normalise()
                         pair_correct = True
@@ -505,19 +542,33 @@ class Urb3DSimulCylinder(Urb3DSimulSphere):
                 area_sel = self.grid_regular_centers[idx, 3].int()
                 pair = self._load_save(area_sel)
                 cylinder_sampler = CylinderSampling(self._radius, centre, align_origin=False)
-                dataPC0 = Data(pos=pair.pos, idx=torch.arange(pair.pos.shape[0]).reshape(-1), sem_y=pair.sem_y, inst_y=pair.inst_y)
+                dataPC0 = Data(pos=pair.pos, rgb=pair.rgb, idx=torch.arange(pair.pos.shape[0]).reshape(-1), sem_y=pair.sem_y, inst_y=pair.inst_y, change_y=pair.change_y)
                 setattr(dataPC0, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC0)
-                dataPC1 = Data(pos=pair.pos_target, idx=torch.arange(pair.pos_target.shape[0]).reshape(-1), sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y_target=pair.change_y_target)
+                dataPC1 = Data(pos=pair.pos_target, rgb=pair.rgb_target, idx=torch.arange(pair.pos_target.shape[0]).reshape(-1), sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y=pair.change_y_target)
                 setattr(dataPC1, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC1)
-                dataPC0_cyl = cylinder_sampler(dataPC0)
-                dataPC1_cyl = cylinder_sampler(dataPC1)
+                full_dataPC0_cyl = cylinder_sampler(dataPC0)
+                full_dataPC1_cyl = cylinder_sampler(dataPC1)
+                if self.pre_transform is not None:
+                    dataPC0_cyl = self.pre_transform(full_dataPC0_cyl.clone())
+                    dataPC1_cyl = self.pre_transform(full_dataPC1_cyl.clone())
+                else:
+                    dataPC0_cyl = full_dataPC0_cyl
+                    dataPC1_cyl = full_dataPC1_cyl
                 try:
                     if self.manual_transform is not None:
                         dataPC0_cyl = self.manual_transform(dataPC0_cyl)
                         dataPC1_cyl = self.manual_transform(dataPC1_cyl)
                     pair_cylinders = Pair(pos=dataPC0_cyl.pos, pos_target=dataPC1_cyl.pos, sem_y=dataPC0_cyl.sem_y, sem_y_target=dataPC1_cyl.sem_y,
-                                          inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y_target=dataPC1_cyl.change_y_target,
-                                          idx=dataPC0_cyl.idx, idx_target=dataPC1_cyl.idx, area=area_sel)
+                                          inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y=dataPC0_cyl.change_y, change_y_target=dataPC1_cyl.change_y,
+                                          sample_ori_pos=dataPC0_cyl.pos.clone(),
+                                          sample_ori_pos_target=dataPC1_cyl.pos.clone(),
+                                          full_pos=full_dataPC0_cyl.pos, full_pos_target=full_dataPC1_cyl.pos,
+                                          full_rgb=full_dataPC0_cyl.rgb.clone(),
+                                          full_rgb_target=full_dataPC1_cyl.rgb.clone(),
+                                          full_sem_y=full_dataPC0_cyl.sem_y, full_sem_y_target=full_dataPC1_cyl.sem_y,
+                                          full_inst_y=full_dataPC0_cyl.inst_y,
+                                          full_inst_y_target=full_dataPC1_cyl.inst_y,full_change_y=full_dataPC0_cyl.change_y, full_change_y_target=full_dataPC1_cyl.change_y,
+                                          idx=dataPC0_cyl.idx, idx_target=dataPC1_cyl.idx, area=area_sel, file_names=self.filesPC0[area_sel])
                     if self.DA:
                         pair_cylinders.data_augment()
                     pair_cylinders.normalise()
@@ -529,35 +580,65 @@ class Urb3DSimulCylinder(Urb3DSimulSphere):
 
     def _get_random(self):
         # Random cylinder biased towards getting more low frequency classes
-        chosen_label = 1.0 #np.random.choice(self._labels, p=self._label_counts)
-        valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
+        if random.random() < 0.5:
+            chosen_label = 1 #np.random.choice(self._i_labels, p=self._i_label_counts)
+            valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
+        else:
+            chosen_label = 1 #np.random.choice(self._c_labels, p=self._c_label_counts)
+            valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, -1] == chosen_label]
+        # chosen_label = 1.0 #np.random.choice(self._labels, p=self._label_counts)
+        # valid_centres = self._centres_for_sampling[self._centres_for_sampling[:, 4] == chosen_label]
         centre_idx = int(random.random() * (valid_centres.shape[0] - 1))
         centre = valid_centres[centre_idx]
         #  choice of the corresponding PC if several PCs are loaded
         area_sel = centre[3].int()
         pair = self._load_save(area_sel)
         cylinder_sampler = CylinderSampling(self._radius, centre[:3], align_origin=False)
-        dataPC0 = Data(pos=pair.pos, sem_y=pair.sem_y, inst_y=pair.inst_y)
+        dataPC0 = Data(pos=pair.pos, rgb=pair.rgb, sem_y=pair.sem_y, inst_y=pair.inst_y, change_y=pair.change_y)
         setattr(dataPC0, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC0)
-        dataPC1 = Data(pos=pair.pos_target, sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y_target=pair.change_y_target)
+        dataPC1 = Data(pos=pair.pos_target, rgb=pair.rgb_target, sem_y=pair.sem_y_target, inst_y=pair.inst_y_target, change_y=pair.change_y_target)
         setattr(dataPC1, CylinderSampling.KDTREE_KEY, pair.KDTREE_KEY_PC1)
-        dataPC0_cyl = cylinder_sampler(dataPC0)
-        dataPC1_cyl = cylinder_sampler(dataPC1)
+        full_dataPC0_cyl = cylinder_sampler(dataPC0)
+        full_dataPC1_cyl = cylinder_sampler(dataPC1)
         if self.manual_transform is not None:
-            dataPC0_cyl = self.manual_transform(dataPC0_cyl)
-            dataPC1_cyl = self.manual_transform(dataPC1_cyl)
-        pair_cyl = Pair(pos=dataPC0_cyl.pos, pos_target=dataPC1_cyl.pos, sem_y=dataPC0_cyl.sem_y, sem_y_target=dataPC1_cyl.sem_y, inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y_target=dataPC1_cyl.change_y_target, area=area_sel)
+            full_dataPC0_cyl = self.manual_transform(full_dataPC0_cyl)
+            full_dataPC1_cyl = self.manual_transform(full_dataPC1_cyl)
+        if self.pre_transform is not None:
+            dataPC0_cyl = self.pre_transform(full_dataPC0_cyl.clone())
+            dataPC1_cyl = self.pre_transform(full_dataPC1_cyl.clone())
+        else:
+            dataPC0_cyl = full_dataPC0_cyl
+            dataPC1_cyl = full_dataPC1_cyl
+        pair_cyl = Pair(pos=dataPC0_cyl.pos, pos_target=dataPC1_cyl.pos, sem_y=dataPC0_cyl.sem_y, sem_y_target=dataPC1_cyl.sem_y,
+                        inst_y=dataPC0_cyl.inst_y, inst_y_target=dataPC1_cyl.inst_y, change_y=dataPC0_cyl.change_y, change_y_target=dataPC1_cyl.change_y,
+                        sample_ori_pos=dataPC0_cyl.pos.clone(), sample_ori_pos_target=dataPC1_cyl.pos.clone(),
+                        full_pos=full_dataPC0_cyl.pos, full_pos_target=full_dataPC1_cyl.pos, full_sem_y=full_dataPC0_cyl.sem_y, full_sem_y_target=full_dataPC1_cyl.sem_y,
+                        full_rgb=full_dataPC0_cyl.rgb.clone(),
+                        full_rgb_target=full_dataPC1_cyl.rgb.clone(),
+                        full_inst_y=full_dataPC0_cyl.inst_y, full_inst_y_target=full_dataPC1_cyl.inst_y, full_change_y=full_dataPC0_cyl.change_y, full_change_y_target=full_dataPC1_cyl.change_y,
+                        area=area_sel, file_names=self.filesPC0[area_sel])
         if self.DA:
             pair_cyl.data_augment()
         pair_cyl.normalise()
+
+        # p0, s0, i0, c0 = pair_cyl.pos.detach().cpu().numpy(), pair_cyl.sem_y.unsqueeze(-1).detach().cpu().numpy().astype(np.int16), pair_cyl.inst_y.unsqueeze(-1).detach().cpu().numpy().astype(np.int16), pair_cyl.change_y.unsqueeze(-1).detach().cpu().numpy().astype(np.int16)
+        # p1, s1, i1, c1 = pair_cyl.pos_target.detach().cpu().numpy(), pair_cyl.sem_y_target.unsqueeze(-1).detach().cpu().numpy().astype(np.int16), pair_cyl.inst_y_target.unsqueeze(-1).detach().cpu().numpy().astype(np.int16), pair_cyl.change_y_target.unsqueeze(-1).detach().cpu().numpy().astype(np.int16)
+        #
+        # output1 = "/home/user/zhanwenxiao/instancesegmentation/data/hkcd/3.ply"
+        # write_ply(output1, [p0, s0, i0, c0],
+        #           ['x', 'y', 'z', 'scalar_label_mono', 'scalar_instance', 'scalar_label_ch'])
+        # output2 = "/home/user/zhanwenxiao/instancesegmentation/data/hkcd/4.ply"
+        # write_ply(output2, [p1, s1, i1, c1],
+        #           ['x', 'y', 'z', 'scalar_label_mono', 'scalar_instance', 'scalar_label_ch'])
+
         return pair_cyl
 
     def _load_save(self, i):
         if self.pre_transform is not None:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self._preproc_clouds_loader(i)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self._preproc_clouds_loader(i)
         else:
-            pc0, pc1, sem_label0, sem_label1, inst_label0, inst_label1, change_label = self.clouds_loader(i, nameInPly=self.nameInPly)
-        pair = Pair(pos=pc0, pos_target=pc1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y_target=change_label)
+            pc0, pc1, rgb0, rgb1, sem_label0, sem_label1, inst_label0, inst_label1, change_label0, change_label1 = self.clouds_loader(i, nameInPly=self.nameInPly)
+        pair = Pair(pos=pc0, pos_target=pc1, rgb=rgb0, rgb_target=rgb1, sem_y=sem_label0, sem_y_target=sem_label1, inst_y=inst_label0, inst_y_target=inst_label1, change_y=change_label0, change_y_target=change_label1)
         pair = self._get_tree(pair, i)
         return pair
 
@@ -615,8 +696,7 @@ class Urb3DSimulCylinder(Urb3DSimulSphere):
             pair.KDTREE_KEY_PC1 = tree
         return pair
 
-
-class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
+class HKDataset(BaseSiameseDataset): #AHNCDDataset AHNCDSimulDataset
     """ Wrapper around Semantic Kitti that creates train and test datasets.
         Parameters
         ----------
@@ -640,7 +720,7 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
         self.DA = self.dataset_opt.DA
         self.TTA = False
         self.preprocessed_dir = self.dataset_opt.preprocessed_dir
-        self.train_dataset = Urb3DSimulCylinder(
+        self.train_dataset = HKCDCylinder(
             filePaths=self.dataset_opt.dataTrainFile,
             split="train",
             radius=self.radius,
@@ -653,7 +733,7 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
             nameInPly=self.dataset_opt.nameInPly,
             fix_cyl=self.dataset_opt.fix_cyl,
         )
-        self.val_dataset = Urb3DSimulCylinder(
+        self.val_dataset = HKCDCylinder(
             filePaths=self.dataset_opt.dataValFile,
             split="val",
             radius=self.radius,
@@ -665,7 +745,7 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
             nameInPly=self.dataset_opt.nameInPly,
             fix_cyl=self.dataset_opt.fix_cyl,
         )
-        self.test_dataset = Urb3DSimulCylinder(
+        self.test_dataset = HKCDCylinder(
             filePaths=self.dataset_opt.dataTestFile,
             split="test",
             radius=self.radius,
@@ -702,7 +782,7 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
 
     @staticmethod
     def to_ply(pos, label, file, color=CHANGE_COLOR):
-        """ Allows to save Urb3DCD predictions to disk using Urb3DCD color scheme
+        """ Allows to save AHNCD predictions to disk using AHNCD color scheme
             Parameters
             ----------
             pos : torch.Tensor
@@ -714,6 +794,20 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
             """
         to_ply(pos, label, file, color=color)
 
+    @staticmethod
+    def to_inst_ply(pos, masks, label, file, color=CHANGE_COLOR):
+        """ Allows to save AHNCD predictions to disk using AHNCD color scheme
+            Parameters
+            ----------
+            pos : torch.Tensor
+                tensor that contains the positions of the points
+            label : torch.Tensor
+                predicted label
+            file : string
+                Save location
+            """
+        to_inst_ply(pos, masks, label, file, color=color)
+
     def get_tracker(self, wandb_log: bool, tensorboard_log: bool, full_pc=False, full_res=False):
         """Factory method for the tracker
             Arguments:
@@ -722,15 +816,33 @@ class Urb3DCDDataset(BaseSiameseDataset): #Urb3DCDDataset Urb3DSimulDataset
             Returns:
                 [BaseTracker] -- tracker
             """
-        return Urb3DiCDTracker(self, wandb_log=wandb_log, use_tensorboard=tensorboard_log,
+        return hkbiCDTracker(self, wandb_log=wandb_log, use_tensorboard=tensorboard_log,
                                  full_pc=full_pc, full_res=full_res, ignore_label=IGNORE_LABEL)
 
 
 ################################### UTILS #######################################
+import colorsys
+from typing import List, Tuple
+import functools
 
+@functools.lru_cache(20)
+def get_evenly_distributed_colors(
+    count: int,
+) -> List[Tuple[np.uint8, np.uint8, np.uint8]]:
+    # lru cache caches color tuples
+    HSV_tuples = [(x / count, 1.0, 1.0) for x in range(count)]
+    random.shuffle(HSV_tuples)
+    return list(
+        map(
+            lambda x: (np.array(colorsys.hsv_to_rgb(*x)) * 255).astype(
+                np.uint8
+            ),
+            HSV_tuples,
+        )
+    )
 
 def to_ply(pos, label, file, color = CHANGE_COLOR, sf = None):
-    """ Allows to save Urb3DCD predictions to disk using Urb3DCD color scheme
+    """ Allows to save AHNCD predictions to disk using AHNCD color scheme
        Parameters
        ----------
        pos : torch.Tensor
@@ -770,3 +882,88 @@ def to_ply(pos, label, file, color = CHANGE_COLOR, sf = None):
     el = PlyElement.describe(ply_array, "params")
     PlyData([el], byte_order=">").write(file)
 
+def to_inst_ply(pos, sorted_masks, label, file, color = CHANGE_COLOR, sf = None):
+    """ Allows to save AHNCD predictions to disk using AHNCD color scheme
+       Parameters
+       ----------
+       pos : torch.Tensor
+           tensor that contains the positions of the points
+       label : torch.Tensor
+           predicted label
+       file : string
+           Save location
+    """
+    assert len(label.shape) == 1
+    assert pos.shape[0] == label.shape[0]
+    pos = np.asarray(pos)
+
+    pred_coords = []
+    pred_normals = []
+    pred_sem_color = []
+    pred_inst_color = []
+
+    for did in range(len(sorted_masks)):
+        instances_colors = torch.from_numpy(
+            np.vstack(
+                get_evenly_distributed_colors(
+                    max(1, sorted_masks[did].shape[1])
+                )
+            )
+        )
+
+        for i in reversed(range(sorted_masks[did].shape[1])):
+            mask_coords = pos[
+                sorted_masks[did][:, i].astype(bool), :
+            ]
+
+            # label = sort_classes[did][i]
+
+            if len(mask_coords) == 0:
+                continue
+
+            pred_coords.append(mask_coords)
+
+            # pred_sem_color.append(
+            #     self.validation_dataset.map2color([label]).repeat(
+            #         mask_coords.shape[0], 1
+            #     )
+            # )
+
+            pred_inst_color.append(
+                instances_colors[i % len(instances_colors)]
+                    .unsqueeze(0)
+                    .repeat(mask_coords.shape[0], 1)
+            )
+
+        if len(pred_coords) > 0:
+            pred_coords = np.concatenate(pred_coords)
+            pred_normals = np.concatenate(pred_normals)
+            # pred_sem_color = np.concatenate(pred_sem_color)
+            pred_inst_color = np.concatenate(pred_inst_color)
+
+    if max(label)<= color.shape[0]:
+        colors = pred_inst_color #color[np.asarray(label)]
+    else:
+        colors = color[np.zeros(pos.shape[0], dtype=np.int)]
+    if sf is None:
+        ply_array = np.ones(
+            pos.shape[0],
+            dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"),
+                   ("green", "u1"), ("blue", "u1"), ("pred", "u2")]
+        )
+    else:
+        ply_array = np.ones(
+            pos.shape[0],
+            dtype=[("x", "f4"), ("y", "f4"), ("z", "f4"), ("red", "u1"),
+                   ("green", "u1"), ("blue", "u1"), ("pred", "u2"), ("sf","f4")]
+        )
+        ply_array["sf"] = np.asarray(sf)
+    ply_array["x"] = pos[:, 0]
+    ply_array["y"] = pos[:, 1]
+    ply_array["z"] = pos[:, 2]
+    ply_array["red"] = colors[:, 0]
+    ply_array["green"] = colors[:, 1]
+    ply_array["blue"] = colors[:, 2]
+    ply_array["pred"] = np.asarray(label)
+    el = PlyElement.describe(ply_array, "params")
+    PlyData([el], byte_order=">").write(file)

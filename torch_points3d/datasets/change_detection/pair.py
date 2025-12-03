@@ -302,9 +302,6 @@ class PairBatch(Pair):
         pair.full_sem_y = None
         pair.full_sem_y_target = None
 
-        # pair.inst_y = None
-        # pair.inst_y_target = None
-
         pair.target_y = target_s
         pair.target_y_target = target_t
         pair.full_target_y = full_target_s

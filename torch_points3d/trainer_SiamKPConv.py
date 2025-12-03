@@ -6,8 +6,6 @@ import torch
 import time
 import logging
 import numpy as np
-import gc
-
 
 # Import building function for model and dataset
 from torch_points3d.datasets.dataset_factory import instantiate_dataset
@@ -57,7 +55,6 @@ class Trainer:
 
         # Get device
         if self._cfg.training.cuda > -1 and torch.cuda.is_available():
-            device = "cuda"
             device = torch.device(self._cfg.training.cuda) #torch.cuda.set_device(self._cfg.training.cuda)
         else:
             device = "cpu"
@@ -92,7 +89,7 @@ class Trainer:
         else:
             self._dataset: BaseDataset = instantiate_dataset(self._cfg.data)
             self._model: BaseModel = instantiate_model(copy.deepcopy(self._cfg), self._dataset)
-            self._model.instantiate_optimizers(self._cfg, True)#"cuda" in device)
+            self._model.instantiate_optimizers(self._cfg, True)
             self._model.set_pretrained_weights()
             if not self._checkpoint.validate(self._dataset.used_properties):
                 log.warning(
@@ -161,9 +158,6 @@ class Trainer:
             if self._dataset.has_val_loader:
                 val_miou_ch = self._test_epoch(epoch, "val")
 
-            # if self._dataset.has_test_loaders:
-            #     test_miou_ch = self._test_epoch(epoch, "test")
-
             if self._cfg.training.optim.early_stop >= 0:
                 if val_miou_ch>max_iou_ch:
                     max_iou_ch = val_miou_ch
@@ -182,8 +176,6 @@ class Trainer:
         self._is_training = False
 
         epoch = self._checkpoint.start_epoch
-        # if self._dataset.has_val_loader:
-        #      self._test_epoch(epoch, "val")
 
         if self._dataset.has_test_loaders:
             if not stage_name or stage_name == "test":
@@ -209,22 +201,15 @@ class Trainer:
         with Ctq(train_loader) as tq_train_loader:
             for i, data in enumerate(tq_train_loader):
                 torch.cuda.empty_cache()
-
-                t_data = time.time() - iter_data_time
-                iter_start_time = time.time()
-                # if len(data.target_y) == 0 or len(data.target_y_target) == 0:
-                #     continue
-
                 self._model.set_input(data, self._device)
                 self._model.optimize_parameters(epoch, self._dataset.batch_size, self._tracker.loss_weight)
+
                 if i % 10 == 0:
                     with torch.no_grad():
                         self._tracker.track(self._model, data=data, **self.tracker_options)
 
                 tq_train_loader.set_postfix(
                     **self._tracker.get_metrics(),
-                    # data_loading=float(t_data),
-                    # iteration=float(time.time() - iter_start_time),
                     a_l=float(self._model.loss_all),
                     c_l=float(self._model.change_loss),
                     m_l=float(self._model.mask_loss),
@@ -233,8 +218,6 @@ class Trainer:
 
                 if self._visualizer.is_active:
                     self._visualizer.save_visuals(self._model.get_current_visuals())
-
-                iter_data_time = time.time()
 
                 if self.early_break:
                     break
@@ -272,21 +255,10 @@ class Trainer:
                 with Ctq(loader) as tq_loader:
                     for data in tq_loader:
                         torch.cuda.empty_cache()
-                        # if stage_name == "val" or stage_name == "test":
-                        #     if len(data.target_y) == 0 or len(data.target_y_target) == 0:
-                        #         continue
-
                         with torch.no_grad():
                             self._model.set_input(data, self._device)
-
-                            t1 = time.time()
-
                             with torch.cuda.amp.autocast(enabled=self._model.is_mixed_precision()):
                                 self._model.forward(epoch=epoch, loss_weight=self._tracker.loss_weight)
-
-                            t2 = time.time()
-                            # print("Pt num {} spend {}".format(data.idx.shape[0] + data.idx_target.shape[0], t2 - t1))
-
                             self._tracker.track(self._model, data=data, **self.tracker_options)
                         tq_loader.set_postfix(**self._tracker.get_metrics(), color=COLORS.TEST_COLOR)
 
